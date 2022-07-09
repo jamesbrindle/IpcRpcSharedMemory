@@ -5,10 +5,10 @@ using System.Runtime.InteropServices;
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
 [assembly: AssemblyTitle("IpcRpcSharedMemory")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyDescription("Local, asynchronous inter-process communication and remote procedure call using memory mapped files (Shared Memory).")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("")]
-[assembly: AssemblyProduct("IpcRpcSharedMemory")]
+[assembly: AssemblyCompany("JB Net Software")]
+[assembly: AssemblyProduct("IpcRpcSharedMemory (JBToolkit)")]
 [assembly: AssemblyCopyright("Copyright ©  2022")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
