@@ -128,7 +128,8 @@ namespace IpcRpcSharedMemory
             RpcPayload data = new RpcPayload
             {
                 MessageGuid = messageId,
-                Content = requestMessage.Content
+                Content = requestMessage.Content,
+                MethodName = requestMessage.MethodName
             };
 
             string xmlData = data.SerializeToXml();
