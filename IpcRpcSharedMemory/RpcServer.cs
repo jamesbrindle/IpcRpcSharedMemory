@@ -1,5 +1,5 @@
 ﻿using IpcRpcSharedMemory.Models;
-using IpcRpcSharedMemory.Models.Utilities;
+using IpcRpcSharedMemory.Utilities;
 using System;
 using System.ComponentModel;
 using System.IO;
@@ -205,7 +205,8 @@ namespace IpcRpcSharedMemory
                                         RemoteCallHandler(payload);
                                         var response = new RpcResponse
                                         {
-                                            MessageGuid = payload.MessageGuid,
+                                            MessageGuid = payload.MessageGuid,     
+                                            MethodName = payload.MethodName,
                                             Content = "OK",
                                             Success = true
                                         };
@@ -219,6 +220,7 @@ namespace IpcRpcSharedMemory
                                         var response = new RpcResponse
                                         {
                                             MessageGuid = payload.MessageGuid,
+                                            MethodName = payload.MethodName,
                                             Content = result.Content,
                                             Success = true
                                         };

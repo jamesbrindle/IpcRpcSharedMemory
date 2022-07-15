@@ -1,8 +1,9 @@
 ﻿using System.IO;
 using System.Runtime.InteropServices;
+using System.Runtime.Serialization.Formatters.Binary;
 using System.Xml.Serialization;
 
-namespace IpcRpcSharedMemory.Models.Utilities
+namespace IpcRpcSharedMemory.Utilities
 {
     /// <summary>
     /// Object / model to byte / byte to object / model

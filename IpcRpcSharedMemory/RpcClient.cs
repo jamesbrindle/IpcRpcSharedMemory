@@ -1,5 +1,5 @@
 ﻿using IpcRpcSharedMemory.Models;
-using IpcRpcSharedMemory.Models.Utilities;
+using IpcRpcSharedMemory.Utilities;
 using System;
 using System.IO;
 using System.IO.MemoryMappedFiles;
@@ -68,6 +68,7 @@ namespace IpcRpcSharedMemory
             var response = new RpcResponse
             {
                 MessageGuid = messageId,
+                MethodName = requestMessage.MethodName,
                 Success = false,
                 Content = "Timed out"
             };
@@ -82,15 +83,16 @@ namespace IpcRpcSharedMemory
                         try
                         {
                             SendMessage(messageId, requestMessage);
-                            response = WaitForResponse(messageId, 200);
+                            response = WaitForResponse(messageId, requestMessage.MethodName, 200);
 
                             if (response.Success || counter > timeout)
                                 break;
                             else
                             {
                                 if (response.Content is string &&
-                                    ((string)response.Content == "Exception" ||
-                                    (string)response.Content == "Duplicate"))
+                                    ((string)response.Content == "Duplicate memory file read - Ignore." ||
+                                    (string)response.Content == "No response from server - Check you've started it." ||
+                                    ((string)response.Content).StartsWith("Exception occurred: ")))
                                 {
                                     counter += 35;
                                 }
@@ -100,7 +102,14 @@ namespace IpcRpcSharedMemory
                                 SafeThread.Sleep(1);
                             }
                         }
-                        catch { }
+                        catch
+                        {
+                            counter += 30;
+                            Thread.Sleep(1);
+                        }
+
+                        if (counter > timeout)
+                            break;
                     }
                 }
                 finally
@@ -152,29 +161,40 @@ namespace IpcRpcSharedMemory
             }
         }
 
-        private RpcResponse WaitForResponse(Guid messageId, int timeout)
+        private RpcResponse WaitForResponse(Guid messageId, string methodName, int timeout)
         {
             RpcResponse successResponse = null;
 
             var timeoutResponse = new RpcResponse
             {
                 MessageGuid = messageId,
+                MethodName = methodName,
                 Success = false,
-                Content = "Timed out"
-            };
-
-            var exception = new RpcResponse
-            {
-                MessageGuid = messageId,
-                Success = false,
-                Content = "Exception"
+                Content = "Timed out."
             };
 
             var duplicateResponse = new RpcResponse
             {
                 MessageGuid = messageId,
+                MethodName = methodName,
                 Success = false,
-                Content = "Duplicate"
+                Content = "Duplicate memory file read - Ignore."
+            };
+
+            var exceptionResponse = new RpcResponse
+            {
+                MessageGuid = messageId,
+                MethodName = methodName,
+                Success = false,
+                Content = "Exception occurred: "
+            };
+
+            var noServerResponse = new RpcResponse
+            {
+                MessageGuid = messageId,
+                MethodName = methodName,
+                Success = false,
+                Content = "No response from server - Check you've started it."
             };
 
             try
@@ -204,6 +224,10 @@ namespace IpcRpcSharedMemory
                                 else
                                     return duplicateResponse;
                             }
+                            catch
+                            {   
+                                return noServerResponse;
+                            }
                             finally
                             {
                                 responseSemaphore.Release();
@@ -212,17 +236,20 @@ namespace IpcRpcSharedMemory
                     }
                 }
             }
-            catch (FileNotFoundException)
+            catch (FileNotFoundException e)
             {
-                return exception;
+                exceptionResponse.Content += e.Message;
+                return exceptionResponse;
             }
-            catch (WaitHandleCannotBeOpenedException)
+            catch (WaitHandleCannotBeOpenedException e)
             {
-                return exception;
+                exceptionResponse.Content += e.Message;
+                return exceptionResponse;
             }
-            catch (AbandonedMutexException)
+            catch (AbandonedMutexException e)
             {
-                return exception;
+                exceptionResponse.Content += e.Message;
+                return exceptionResponse;
             }
 
             if (successResponse == null)

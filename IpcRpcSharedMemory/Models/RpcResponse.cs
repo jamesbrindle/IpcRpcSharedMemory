@@ -54,5 +54,10 @@ namespace IpcRpcSharedMemory.Models
         /// If the request has handled by the listener and sent back to you
         /// </summary>
         public bool Success { get; set; }
+
+        /// <summary>
+        /// The request method if one was provided - Passed back
+        /// </summary>
+        public string MethodName { get; set; }
     }
 }
