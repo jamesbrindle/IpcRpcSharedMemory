@@ -3,6 +3,7 @@ using IpcRpcSharedMemory.Utilities;
 using System;
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -36,18 +37,12 @@ namespace IpcRpcSharedMemory
         /// </summary>
         /// <param name="listenerName">The RpcListener name - Will be unique to that host / process / server</param>
         /// <param name="capacity">The RpcListener name - Will be unique to that host / process / server</param>
-
         public RpcClient(string listenerName, int capacity = 1024)
         {
             ValidateInit(listenerName, capacity);
 
             ListenerName = listenerName;
             Capacity = capacity;
-
-            _listenerMappedFile = MemoryMappedFile.CreateOrOpen(
-                ListenerName + "_Listener_MappedFile", Capacity, MemoryMappedFileAccess.ReadWrite);
-
-            _listenerMappedFileAccessor = _listenerMappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
         }
 
         /// <summary>
@@ -73,42 +68,47 @@ namespace IpcRpcSharedMemory
                 Content = "Timed out"
             };
 
-            if (requestSemaphore.WaitOne(timeout))
+            if (requestSemaphore.WaitOne())
             {
                 try
                 {
-                    int counter = 0;
+
+                    int resendCounter = 0;
                     while (true)
                     {
+                        int readCounter = 0;
                         try
                         {
                             SendMessage(messageId, requestMessage);
-                            response = WaitForResponse(messageId, requestMessage.MethodName, 200);
-
-                            if (response.Success || counter > timeout)
-                                break;
-                            else
+                            while (!response.Success)
                             {
-                                if (response.Content is string &&
-                                    ((string)response.Content == "Duplicate memory file read - Ignore." ||
-                                    (string)response.Content == "No response from server - Check you've started it." ||
-                                    ((string)response.Content).StartsWith("Exception occurred: ")))
-                                {
-                                    counter += 35;
-                                }
+                                response = ReadResponse(messageId, requestMessage.MethodName, 200);
+                                if (response.Success || readCounter > 50 || resendCounter > timeout)
+                                    break;
                                 else
-                                    counter += 200;
+                                {
+                                    if (response.Content is string &&
+                                        ((string)response.Content == "Duplicate memory file read - Ignore." ||
+                                        (string)response.Content == "No response from server - Check you've started it." ||
+                                        ((string)response.Content).StartsWith("Exception occurred: ")))
+                                    {
+                                        readCounter++;
+                                        resendCounter += 30;
+                                    }
+                                    else
+                                        resendCounter += 200;
+                                }
 
                                 SafeThread.Sleep(1);
                             }
                         }
                         catch
                         {
-                            counter += 30;
-                            Thread.Sleep(1);
+                            resendCounter += 30;
+                            SafeThread.Sleep(1);
                         }
 
-                        if (counter > timeout)
+                        if (response.Success || resendCounter > timeout)
                             break;
                     }
                 }
@@ -152,6 +152,15 @@ namespace IpcRpcSharedMemory
             {
                 try
                 {
+                    if (_listenerMappedFile == null)
+                    {
+                        _listenerMappedFile = MemoryMappedFile.CreateOrOpen(
+                            ListenerName + "_Listener_MappedFile", Capacity, MemoryMappedFileAccess.ReadWrite);
+                    }
+
+                    if (_listenerMappedFileAccessor == null)
+                        _listenerMappedFileAccessor = _listenerMappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
+
                     _listenerMappedFileAccessor.WriteArray<byte>(0, buffer, 0, buffer.Length);
                 }
                 finally
@@ -161,11 +170,9 @@ namespace IpcRpcSharedMemory
             }
         }
 
-        private RpcResponse WaitForResponse(Guid messageId, string methodName, int timeout)
+        private RpcResponse ReadResponse(Guid messageId, string methodName, int timeout)
         {
-            RpcResponse successResponse = null;
-
-            var timeoutResponse = new RpcResponse
+            var response = new RpcResponse
             {
                 MessageGuid = messageId,
                 MethodName = methodName,
@@ -173,89 +180,68 @@ namespace IpcRpcSharedMemory
                 Content = "Timed out."
             };
 
-            var duplicateResponse = new RpcResponse
-            {
-                MessageGuid = messageId,
-                MethodName = methodName,
-                Success = false,
-                Content = "Duplicate memory file read - Ignore."
-            };
-
-            var exceptionResponse = new RpcResponse
-            {
-                MessageGuid = messageId,
-                MethodName = methodName,
-                Success = false,
-                Content = "Exception occurred: "
-            };
-
-            var noServerResponse = new RpcResponse
-            {
-                MessageGuid = messageId,
-                MethodName = methodName,
-                Success = false,
-                Content = "No response from server - Check you've started it."
-            };
-
             try
             {
                 SafeThread.Sleep(1); // Give some time for other threads to have a go.
 
-                using (MemoryMappedFile file = MemoryMappedFile.OpenExisting(
-                    ListenerName + "_Response_MappedFile", MemoryMappedFileRights.Read))
+                var responseSemaphore = new Semaphore(0, 1, ListenerName + "_Response_Semaphore", out bool semaphoreCreatedNew);
+                if (semaphoreCreatedNew)
+                    responseSemaphore.Release();
+
+                if (responseSemaphore.WaitOne(timeout))
                 {
-                    using (MemoryMappedViewAccessor accessor = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
+                    try
                     {
-                        var responseSemaphore = new Semaphore(0, 1, ListenerName + "_Response_Semaphore", out bool semaphoreCreatedNew);
-                        if (semaphoreCreatedNew)
-                            responseSemaphore.Release();
-
-                        if (responseSemaphore.WaitOne(timeout))
+                        using (MemoryMappedFile file = MemoryMappedFile.OpenExisting(
+                            ListenerName + "_Response_MappedFile", MemoryMappedFileRights.Read))
                         {
-                            try
+                            using (MemoryMappedViewAccessor accessor = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
                             {
-                                byte[] buffer = new byte[accessor.Capacity];
-                                accessor.ReadArray<byte>(0, buffer, 0, buffer.Length);
-                                successResponse = Serialization.DeserializeFromXml<RpcResponse>(
-                                    buffer.ConvertByteArrayToString());
+                                try
+                                {
+                                    byte[] buffer = new byte[accessor.Capacity];
+                                    accessor.ReadArray<byte>(0, buffer, 0, buffer.Length);
 
-                                if (successResponse.MessageGuid == messageId)
-                                    return successResponse;
-                                else
-                                    return duplicateResponse;
-                            }
-                            catch
-                            {   
-                                return noServerResponse;
-                            }
-                            finally
-                            {
-                                responseSemaphore.Release();
+                                    if (buffer.Any(b => b != 0))
+                                    {
+                                        response = Serialization.DeserializeFromXml<RpcResponse>(
+                                        buffer.ConvertByteArrayToString());
+
+                                        if (response.MessageGuid != messageId)
+                                        {
+                                            response.Success = false;
+                                            response.Content = "Duplicate memory file read - Ignore.";
+                                        }
+                                    }
+                                    else
+                                    {
+                                        response.Content = "No response from server - Check you've started it.";
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    response.Content = "Exception occurred: " + ex.Message;
+                                }
                             }
                         }
                     }
+                    finally
+                    {
+                        responseSemaphore.Release();
+                    }
                 }
             }
-            catch (FileNotFoundException e)
+            catch (FileNotFoundException)
             {
-                exceptionResponse.Content += e.Message;
-                return exceptionResponse;
+                response.Success = false;
+                response.Content = "No response from server - Check you've started it.";
             }
             catch (WaitHandleCannotBeOpenedException e)
             {
-                exceptionResponse.Content += e.Message;
-                return exceptionResponse;
-            }
-            catch (AbandonedMutexException e)
-            {
-                exceptionResponse.Content += e.Message;
-                return exceptionResponse;
+                response.Content = "Exception occurred: " + e.Message;
             }
 
-            if (successResponse == null)
-                return timeoutResponse;
-
-            return successResponse;
+            return response;
         }
 
         private void ValidateInit(string listenerName, int capacity)
@@ -279,7 +265,7 @@ namespace IpcRpcSharedMemory
                 timeout = 5000;
 
             // Try not to bombard thread safety all at once
-            Thread.Sleep(new Random().Next(1, 10));
+            SafeThread.Sleep(new Random().Next(1, 10));
         }
 
         /// <summary>
@@ -289,8 +275,11 @@ namespace IpcRpcSharedMemory
         {
             Disposed = true;
 
-            _listenerMappedFileAccessor.Dispose();
-            _listenerMappedFile.Dispose();
+            if (_listenerMappedFileAccessor != null)
+                _listenerMappedFileAccessor.Dispose();
+
+            if (_listenerMappedFile != null)
+                _listenerMappedFile.Dispose();
         }
     }
 }

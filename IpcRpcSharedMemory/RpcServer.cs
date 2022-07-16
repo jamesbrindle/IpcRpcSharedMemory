@@ -2,7 +2,6 @@
 using IpcRpcSharedMemory.Utilities;
 using System;
 using System.ComponentModel;
-using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Threading;
@@ -45,11 +44,11 @@ namespace IpcRpcSharedMemory
 
         private byte[] _lastMessageBytes = null;
         private Guid _lastMessageGuid = Guid.NewGuid();
-        private Thread _listenerThread = null;
         private BindingList<RpcUnprocessItem> _incomingMessages = new BindingList<RpcUnprocessItem>();
         private BindingList<RpcUnprocessItem> _outgoingMessages = new BindingList<RpcUnprocessItem>();
         private MemoryMappedFile _responseMappedFile = null;
         private MemoryMappedViewAccessor _responseMappedFileAccessor = null;
+        private CancellationTokenSource _listenerCancellationToken = null;
 
         /// <summary>
         /// Create new RpcListener with an action callback (just 'do something' and don't pass any data back) apart
@@ -75,11 +74,6 @@ namespace IpcRpcSharedMemory
 
             _incomingMessages.ListChanged += ProcessIncomingMessage;
             _outgoingMessages.ListChanged += ProcessOutgoingMessage;
-
-            _responseMappedFile = MemoryMappedFile.CreateOrOpen(
-                ListenerName + "_Response_MappedFile", Capacity, MemoryMappedFileAccess.ReadWrite);
-
-            _responseMappedFileAccessor = _responseMappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
         }
 
         /// <summary>
@@ -105,11 +99,6 @@ namespace IpcRpcSharedMemory
 
             _incomingMessages.ListChanged += ProcessIncomingMessage;
             _outgoingMessages.ListChanged += ProcessOutgoingMessage;
-
-            _responseMappedFile = MemoryMappedFile.CreateOrOpen(
-                ListenerName + "_Response_MappedFile", Capacity, MemoryMappedFileAccess.ReadWrite);
-
-            _responseMappedFileAccessor = _responseMappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
         }
 
         /// <summary>
@@ -124,30 +113,27 @@ namespace IpcRpcSharedMemory
                 return this;
 
             Listening = true;
-            if (_listenerThread != null)
+            if (_listenerCancellationToken != null)
             {
                 try
                 {
-                    _listenerThread.Abort();
+                    _listenerCancellationToken.Cancel();
                 }
                 catch { }
             }
 
-            _listenerThread = null;
-            _listenerThread = new Thread((ThreadStart)delegate
+            _listenerCancellationToken = new CancellationTokenSource();
+            Task.Factory.StartNew(delegate
             {
-                while (Listening)
+                while (Listening && !_listenerCancellationToken.Token.IsCancellationRequested)
                 {
                     ReadRequestData();
                     SafeThread.Sleep(PollFrequency);
                 }
-            })
-            {
-                IsBackground = true,
-                Priority = ThreadPriority.AboveNormal
-            };
-
-            _listenerThread.Start();
+            },
+           _listenerCancellationToken.Token,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
 
             return this;
         }
@@ -162,13 +148,14 @@ namespace IpcRpcSharedMemory
 
             try
             {
-                _listenerThread.Abort();
+                if (_listenerCancellationToken != null)
+                    _listenerCancellationToken.Cancel();
             }
             catch { }
 
             try
             {
-                _listenerThread = null;
+                _listenerCancellationToken = null;
             }
             catch { }
 
@@ -198,14 +185,12 @@ namespace IpcRpcSharedMemory
                                     _lastMessageGuid != payload.MessageGuid &&
                                     payload.MessageGuid != Guid.Empty)
                                 {
-                                    _lastMessageGuid = payload.MessageGuid;
-
                                     if (RemoteCallHandler != null)
                                     {
                                         RemoteCallHandler(payload);
                                         var response = new RpcResponse
                                         {
-                                            MessageGuid = payload.MessageGuid,     
+                                            MessageGuid = payload.MessageGuid,
                                             MethodName = payload.MethodName,
                                             Content = "OK",
                                             Success = true
@@ -227,6 +212,8 @@ namespace IpcRpcSharedMemory
 
                                         AddToResponseQueue(response);
                                     }
+
+                                    _lastMessageGuid = payload.MessageGuid;
                                 }
                             });
                         }
@@ -268,53 +255,51 @@ namespace IpcRpcSharedMemory
             {
                 SafeThread.Sleep(1); // Give some time for other threads to have a go.
 
-                using (MemoryMappedFile file = MemoryMappedFile.OpenExisting(
-                    ListenerName + "_Listener_MappedFile", MemoryMappedFileRights.Read))
-                {
-                    using (MemoryMappedViewAccessor accessor = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
-                    {
-                        var listenerSemaphore = new Semaphore(0, 1, ListenerName + "_Listener_Semaphore", out bool semaphoreCreatedNew);
-                        if (semaphoreCreatedNew)
-                            listenerSemaphore.Release();
+                var listenerSemaphore = new Semaphore(0, 1, ListenerName + "_Listener_Semaphore", out bool semaphoreCreatedNew);
+                if (semaphoreCreatedNew)
+                    listenerSemaphore.Release();
 
-                        if (listenerSemaphore.WaitOne(100))
+                if (listenerSemaphore.WaitOne(100))
+                {
+                    try
+                    {
+                        using (MemoryMappedFile file = MemoryMappedFile.OpenExisting(
+                            ListenerName + "_Listener_MappedFile", MemoryMappedFileRights.Read))
                         {
-                            try
+                            using (MemoryMappedViewAccessor accessor = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read))
                             {
                                 byte[] buffer = new byte[accessor.Capacity];
                                 accessor.ReadArray<byte>(0, buffer, 0, buffer.Length);
 
-                                if (!Serialization.ByteArrayCompare(buffer, _lastMessageBytes))
+                                if (buffer.Any(b => b != 0))
                                 {
-                                    _lastMessageBytes = buffer;
-                                    Task.Factory.StartNew(delegate
+                                    if (!Serialization.ByteArrayCompare(buffer, _lastMessageBytes))
                                     {
-                                        // Add to a queue for another thread to deserialise for performance
-                                        lock (_incomingMessages)
+                                        _lastMessageBytes = buffer;
+                                        Task.Factory.StartNew(delegate
                                         {
-                                            _incomingMessages.Add(new RpcUnprocessItem
+                                            // Add to a queue for another thread to deserialise for performance
+                                            lock (_incomingMessages)
                                             {
-                                                Id = Guid.NewGuid(),
-                                                Bytes = buffer
-                                            });
-                                        }
-                                    });
+                                                _incomingMessages.Add(new RpcUnprocessItem
+                                                {
+                                                    Id = Guid.NewGuid(),
+                                                    Bytes = buffer
+                                                });
+                                            }
+                                        });
+                                    }
                                 }
-                            }
-                            finally
-                            {
-                                listenerSemaphore.Release();
                             }
                         }
                     }
+                    finally
+                    {
+                        listenerSemaphore.Release();
+                    }
                 }
             }
-            catch (FileNotFoundException)
-            { }
-            catch (WaitHandleCannotBeOpenedException)
-            { }
-            catch (AbandonedMutexException)
-            { }
+            catch { }
         }
 
         private void ProcessOutgoingMessage(object sender, ListChangedEventArgs e)
@@ -352,6 +337,15 @@ namespace IpcRpcSharedMemory
             {
                 try
                 {
+                    if (_responseMappedFile == null)
+                    {
+                        _responseMappedFile = MemoryMappedFile.CreateOrOpen(
+                            ListenerName + "_Response_MappedFile", Capacity, MemoryMappedFileAccess.ReadWrite);
+                    }
+
+                    if (_responseMappedFileAccessor == null)
+                        _responseMappedFileAccessor = _responseMappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
+
                     _responseMappedFileAccessor.WriteArray<byte>(0, responseBuffer, 0, responseBuffer.Length);
                 }
                 finally
@@ -443,13 +437,14 @@ namespace IpcRpcSharedMemory
 
             try
             {
-                _listenerThread.Abort();
+                if (_listenerCancellationToken != null)
+                    _listenerCancellationToken.Cancel();
             }
             catch { }
 
             try
             {
-                _listenerThread = null;
+                _listenerCancellationToken = null;
             }
             catch { }
 
